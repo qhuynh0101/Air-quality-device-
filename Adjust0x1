@@ -1,0 +1,299 @@
+/*
+ Measures co2, humidity, temperature, pm, and no2
+ Setup: starts SD Card and starts the co2 and pm sensors following the example code
+ if the named file does not exist, it is created and data labels are added to the top of the file
+
+ each loop opens the file, moves the servo to the inside position and polls all of the sensors while writing to the sd card. it then turns
+ to the outside and polls/writes again. the servo then turns to the neutral position and the file closes.
+ there is a delay between each loop starting
+
+*/
+
+#include <SPI.h>
+#include <SD.h>
+#include <Arduino.h>
+#include <SensirionI2cScd30.h>
+#include <SensirionI2CSen5x.h>
+#include <Servo.h>
+#include <Wire.h>
+
+#define MAXBUF_REQUIREMENT 48
+
+#if (defined(I2C_BUFFER_LENGTH) && \
+     (I2C_BUFFER_LENGTH >= MAXBUF_REQUIREMENT)) || \
+    (defined(BUFFER_LENGTH) && BUFFER_LENGTH >= MAXBUF_REQUIREMENT)
+#define USE_PRODUCT_INFO
+#endif
+
+#define SERV_INSIDE 0
+#define SERV_OUTSIDE 185 //these will depend on the orientation of the device
+#define SERV_IDLE 90
+#define SERV_PIN 6
+
+SensirionI2cScd30 sensor;
+SensirionI2CSen5x sen5x;
+Servo valveServo;
+File myFile;
+
+const char fileName[] = "envdata523.txt"; //does not like capital letters
+const unsigned long measurementGap = (30 * 60 * 1000); //minutes
+static char errorMessage[128]; // Used by SCD30 error reporting
+static int16_t error; // General error variable
+
+// ADDED: Basic errorToString function implementation
+// For more detailed error messages, use the function provided by Sensirion examples if available.
+void errorToString(int16_t localError, char* localErrorMessage, size_t bufferSize) {
+    if (bufferSize == 0) return; // Cannot write to zero-size buffer
+    if (localError == NO_ERROR) { // NO_ERROR is typically 0, defined in Sensirion libraries
+        strncpy(localErrorMessage, "No error", bufferSize -1);
+    } else {
+        snprintf(localErrorMessage, bufferSize -1, "Error code: %d", localError);
+    }
+    localErrorMessage[bufferSize - 1] = '\0'; // Ensure null termination
+}
+
+
+void setup() {
+  valveServo.attach(SERV_PIN);
+  // Open serial communications and wait for port to open:
+
+  Serial.begin(9600);
+  while (!Serial) {
+    ; // wait for serial port to connect. Needed for native USB port only
+  }
+
+
+  Serial.print("Initializing SD card...");
+
+  if (!SD.begin(4)) {
+    Serial.println("initialization failed!");
+    while (1);
+  }
+  Serial.println("initialization done.");
+
+  {
+    Wire.begin();
+    sensor.begin(Wire, SCD30_I2C_ADDR_61);
+    {
+      sensor.stopPeriodicMeasurement();
+      sensor.softReset();
+      delay(2000);
+      uint8_t major = 0;
+      uint8_t minor = 0;
+      error = sensor.readFirmwareVersion(major, minor);
+      if (error != NO_ERROR) {
+        Serial.print("Error trying to execute readFirmwareVersion(): ");
+        errorToString(error, errorMessage, sizeof errorMessage);
+        Serial.println(errorMessage);
+        return;
+      }
+      Serial.print("firmware version major: ");
+      Serial.print(major);
+      Serial.print(",");
+      Serial.print("minor: ");
+      Serial.print(minor);
+      Serial.println();
+      error = sensor.startPeriodicMeasurement(0);
+      if (error != NO_ERROR) {
+        Serial.print("Error trying to execute startPeriodicMeasurement(): ");
+        errorToString(error, errorMessage, sizeof errorMessage);
+        Serial.println(errorMessage);
+        return;
+      }
+    }
+    {
+      Serial.println("Setting up PM Sensor");
+      sen5x.begin(Wire);
+      float tempOffset = 0.0;
+      // MODIFIED: Using a local errorMessage buffer for SEN5x as it did in ReadPMSensor and passed 256
+      char sen5xErrorMessage[256];
+      error = sen5x.setTemperatureOffsetSimple(tempOffset);
+      if (error) {
+        Serial.print("Error trying to execute setTemperatureOffsetSimple(): ");
+        errorToString(error, sen5xErrorMessage, sizeof sen5xErrorMessage); // MODIFIED: using local buffer
+        Serial.println(sen5xErrorMessage);
+      } else {
+        Serial.print("Temperature Offset set to ");
+        Serial.print(tempOffset);
+        Serial.println(" deg. Celsius (SEN54/SEN55 only)");
+      }
+    }
+  }
+  // Start Measurement for SEN5x
+  // MODIFIED: Using a local errorMessage buffer for SEN5x as it did in ReadPMSensor and passed 256
+  char sen5xStartErrorMessage[256];
+  error = sen5x.startMeasurement();
+  if (error) {
+    Serial.print("Error trying to execute startMeasurement(): ");
+    errorToString(error, sen5xStartErrorMessage, sizeof sen5xStartErrorMessage); // MODIFIED: using local buffer
+    Serial.println(sen5xStartErrorMessage);
+  }
+
+
+  // open the file. note that only one file can be open at a time,
+  // so you have to close this one before opening another.
+
+  //TODO: Place categories at the top if the file does not exist, else continue on
+  if (!SD.exists(fileName)) {
+    myFile = SD.open(fileName, FILE_WRITE);
+    if (myFile) { // ADDED: Check if file opened successfully
+        myFile.println("inPm1p0,inPm2p5,inPm4p0,inPm10p0,inAmbientHumidity,inAmbientTemperature,inco2Concentration,intemperature,inhumidity,inNO2,outPm1p0,outPm2p5,outPm4p0,outPm10p0,outAmbientHumidity,outAmbientTemperature,outco2Concentration,outtemperature,outhumidity,outNO2,Time");
+        myFile.close();
+    } else {
+        Serial.println("Error opening file to write header!");
+    }
+  }
+
+  pinMode(A0, INPUT);
+}
+
+void loop() {
+  // nothing happens after setup // MODIFIED: This comment is misleading for the loop function.
+  unsigned long measurementStartTime = millis();
+  myFile = SD.open(fileName, FILE_WRITE);
+
+  if (!myFile) { // ADDED: Check if file opened successfully
+      Serial.println("Failed to open file for writing in loop!");
+      delay(1000); // Wait a bit before retrying or halting
+      return; // Skip this loop iteration if file can't be opened
+  }
+
+  valveServo.write(SERV_INSIDE);
+  delay(3 * 60000); //time to flush air and turn valveServo
+  //measure inside
+  ReadPMSensor();
+  ReadCO2Sensor();
+  myFile.print(analogRead(A0));
+  myFile.print(",");
+
+  valveServo.write(SERV_OUTSIDE);
+  delay(60000 * 3); //time to flush air and turn valveServo
+  //measure outside
+  ReadPMSensor();
+  ReadCO2Sensor();
+  myFile.print(analogRead(A0));
+  myFile.print(",");
+
+  valveServo.write(SERV_IDLE);
+
+  //myFile.print("Time: ");
+  unsigned int measurementMins = (millis() - measurementStartTime) / 60000; // MODIFIED: Calculate duration of current cycle for more accurate time logging relative to start
+  unsigned long currentOperationTimeHours = (millis() / (1000UL * 60 * 60));
+  unsigned long currentOperationTimeMins = (millis() / (1000UL * 60)) % 60;
+
+  myFile.print(currentOperationTimeHours); //hr
+  myFile.print(":");
+  if (currentOperationTimeMins < 10) myFile.print("0"); // ADDED: leading zero for minutes
+  myFile.println(currentOperationTimeMins); //min
+
+  // Serial.println(myFile); // MODIFIED: This does not print file content. See previous explanation.
+  if (myFile) { // ADDED: A more meaningful check for serial output
+      Serial.println("Data written to SD card for this cycle.");
+  } else {
+      Serial.println("myFile object is not valid (already closed or failed to open).");
+  }
+  myFile.close();
+
+  unsigned long loopDuration = millis() - measurementStartTime;
+  if (loopDuration < measurementGap) {
+      delay(measurementGap - loopDuration); //time in minutes
+  } else {
+      Serial.println("Warning: Measurement cycle took longer than measurementGap!");
+  }
+
+
+  if ((millis() / (1000UL * 60 * 60)) >= 10) { //MODIFIED: Check total uptime in hours, use >=
+    Serial.println("10 hours of measurement finished.");
+    // File is already closed at the end of the loop, no need to close again unless an early exit.
+    while (1);
+  }
+}
+
+float ReadCO2Sensor() {
+  // "nothing happens after setup" comment is misleading here.
+  float co2Concentration = 0.0;
+  float temperature = 0.0;
+  float humidity = 0.0;
+  // Using global 'error' and 'errorMessage' as originally intended for SCD30
+  error = sensor.blockingReadMeasurementData(co2Concentration, temperature, humidity);
+  if (error != NO_ERROR) {
+    if (myFile) { // ADDED: Check if file is open before writing
+        myFile.print("ErrorSCD30:"); // MODIFIED: Indicate which sensor had an error
+        errorToString(error, errorMessage, sizeof errorMessage);
+        myFile.print(errorMessage); // MODIFIED: Print only the message, not another "Error..."
+        myFile.print(","); // Ensure consistent CSV structure
+    }
+    // MODIFIED: Return a specific float value to indicate error.
+    // The return value is not currently used in loop(), but this is good practice.
+    return -1.0f;
+  }
+
+  if (myFile) { // ADDED: Check if file is open before writing
+    // myFile.print("co2Concentration: ");
+    myFile.print(co2Concentration);
+    myFile.print(",");
+    //myFile.print("temperature: ");
+    myFile.print(temperature);
+    myFile.print(",");
+    //myFile.print("humidity: ");
+    myFile.print(humidity);
+    myFile.print(",");
+  }
+  return 1.0f; // MODIFIED: Indicate success, use f for float literal
+}
+
+void ReadPMSensor() {
+  uint16_t local_sen5x_error; // MODIFIED: Use a local error variable to avoid conflict with global 'error' if not intended
+  char local_sen5x_errorMessage[256]; // Using local buffer as in original
+
+  // Read Measurement
+  float Pm1p0;
+  float Pm2p5;
+  float Pm4p0;
+  float Pm10p0;
+  float ambientHumidity;
+  float ambientTemperature;
+  float vocIndex;
+  float noxIndex; // This is read but not currently logged to SD.
+
+  local_sen5x_error = sen5x.readMeasuredValues(
+      Pm1p0, Pm2p5, Pm4p0,
+      Pm10p0, ambientHumidity, ambientTemperature, vocIndex,
+      noxIndex);
+
+  if (local_sen5x_error) {
+    if (myFile) { // ADDED: Check if file is open before writing
+        myFile.print("ErrorSEN5x:"); // MODIFIED: Indicate which sensor had an error
+        errorToString(local_sen5x_error, local_sen5x_errorMessage, sizeof local_sen5x_errorMessage);
+        myFile.print(local_sen5x_errorMessage); // MODIFIED: Print only the message
+        myFile.print(",,,,,"); // MODIFIED: Print empty placeholders for the 6 SEN5x values to keep CSV consistent
+    }
+  } else if (myFile) { // Check if file is open before writing
+    //myFile.print("Pm1p0:");
+    myFile.print(Pm1p0);
+    myFile.print(",");
+    //myFile.print("Pm2p5:");
+    myFile.print(Pm2p5);
+    myFile.print(",");
+    //myFile.print("Pm4p0:");
+    myFile.print(Pm4p0);
+    myFile.print(",");
+    //myFile.print("Pm10p0:");
+    myFile.print(Pm10p0);
+    myFile.print(",");
+    //myFile.print("AmbientHumidity:");
+    if (isnan(ambientHumidity)) {
+      myFile.print("n/a");
+    } else {
+      myFile.print(ambientHumidity);
+    }
+    myFile.print(",");
+    //myFile.print("AmbientTemperature:");
+    if (isnan(ambientTemperature)) {
+      myFile.print("n/a");
+    } else {
+      myFile.print(ambientTemperature);
+    }
+    myFile.print(",");
+  }
+}
